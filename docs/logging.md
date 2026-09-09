@@ -312,6 +312,18 @@ integrity check; resumed validation and repair can still run on the opener.
 Correlate the process ID with the log timestamp and current process; PIDs can be
 reused after exit.
 
+SQLite reclamation Workers also emit `slow SQLite reclamation Worker operation`
+at `warn` when their joined operation takes at least one second. The record is
+emitted after Worker exit and parent admission settlement. It includes the
+parent's `pid`, `threadId` and `isMainThread`, the actual Node `workerThreadId`,
+`reclamationKind`, `elapsedMs`, terminal `outcome` (`resolved` or `rejected`), and
+`exitCode`. Timing starts after admission to the archive Worker queue and includes
+startup, validation, admission waits, work, and cleanup. It does not measure CPU
+time or isolate a validation phase. Short writer sections can therefore remain
+quiet while this whole-operation warning exposes slow preparation between them.
+The record inherits an existing parent trace when available; it contains no
+database path, session identifier, plan content, or raw error.
+
 ### Slow reply preparation
 
 When a reply spends a long time preparing, inspect the normal Gateway logs:
@@ -326,6 +338,11 @@ flags, they warn at 10 seconds elapsed or 5 seconds in one preparation stage. Co
 logs each completed slow stage immediately, including failures, and emits a
 `native-turn-handoff` summary before submitting the native turn. Timing records
 contain stage names and identifiers, not prompts or tool arguments.
+
+Embedded-run startup, prep, core-plugin-tool and auth stage summaries include
+`pid`, `threadId` and `isMainThread` in the message to distinguish emitters sharing
+a log file. These identify the summary emitter, not where every timed operation
+ran. Elapsed stage time can include asynchronous waits and is not CPU time.
 
 Use the first `turn_accepted`, `model_call_started`, `tool_execution_started`, and
 `assistant_output_started` milestones to separate startup from later activity.

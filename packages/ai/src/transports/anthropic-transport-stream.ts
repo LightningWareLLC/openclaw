@@ -22,7 +22,6 @@ import {
 } from "../providers/anthropic-auth-headers.js";
 import {
   applyClaudeRequestContract,
-  ANTHROPIC_CLAUDE_CODE_BILLING_SYSTEM_BLOCK,
   ANTHROPIC_CLAUDE_CODE_VERSION,
   defaultsClaudeAdaptiveThinking,
   prepareClaudeNoPrefillRequestContext,
@@ -56,11 +55,12 @@ import {
   buildAnthropicGenerationParams,
 } from "./anthropic-messages.js";
 import {
-  applyAnthropicPayloadPolicyToParams,
+  applyAnthropicRequestCacheControl,
+  buildAnthropicSystemBlocks,
   applyAnthropicContextManagementToRequest,
   isDirectAnthropicModel,
   resolveAnthropicContextManagementBetaHeader,
-  resolveAnthropicPayloadPolicy,
+  resolveAnthropicCacheOptions,
 } from "./anthropic-payload-policy.js";
 import { consumeAnthropicStream, type AnthropicStreamBlock } from "./anthropic-stream-reducer.js";
 import { createAssistantOutput } from "./assistant-output.js";
@@ -77,7 +77,6 @@ import {
   finalizeTransportStream,
   mergeTransportHeaders,
   notifyProviderHttpResponse,
-  sanitizeTransportPayloadText,
 } from "./transport-stream-shared.js";
 import {
   createAbortError as createNamedAbortError,
@@ -569,15 +568,9 @@ async function buildAnthropicParams(
       `Anthropic Messages transport requires a positive maxTokens value for ${model.provider}/${model.id}`,
     );
   }
-  const payloadPolicy = resolveAnthropicPayloadPolicy(
-    {
-      provider: model.provider,
-      api: model.api,
-      baseUrl: model.baseUrl,
-      cacheRetention: options?.cacheRetention,
-      enableCacheControl: true,
-    },
+  const { cacheControl, supportsCacheControlOnTools } = resolveAnthropicCacheOptions(
     model,
+    options?.cacheRetention,
   );
   const replayPlan = buildAnthropicReplayPlan(context.messages, model, {
     enabled: !isOAuthToken && options?.anthropicServerCompaction === true,
@@ -609,33 +602,9 @@ async function buildAnthropicParams(
   if (!isOAuthToken && useAnthropicServerSideFallback(model)) {
     params.fallbacks = ANTHROPIC_SERVER_SIDE_FALLBACKS;
   }
-  if (isOAuthToken) {
-    params.system = [
-      // Anthropic requires this first block to route Claude subscription OAuth billing.
-      {
-        type: "text",
-        text: ANTHROPIC_CLAUDE_CODE_BILLING_SYSTEM_BLOCK,
-      },
-      {
-        type: "text",
-        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-      },
-      ...(context.systemPrompt
-        ? [
-            {
-              type: "text",
-              text: sanitizeTransportPayloadText(context.systemPrompt),
-            },
-          ]
-        : []),
-    ];
-  } else if (context.systemPrompt) {
-    params.system = [
-      {
-        type: "text",
-        text: sanitizeTransportPayloadText(context.systemPrompt),
-      },
-    ];
+  const system = buildAnthropicSystemBlocks(context.systemPrompt, isOAuthToken, cacheControl);
+  if (system) {
+    params.system = system;
   }
   const convertedTools = context.tools
     ? convertAnthropicTools(context.tools, isOAuthToken)
@@ -651,7 +620,12 @@ async function buildAnthropicParams(
       profile: "transport",
     }),
   );
-  applyAnthropicPayloadPolicyToParams(params, payloadPolicy, cacheBreakpointOptOutMessageIndexes);
+  applyAnthropicRequestCacheControl(
+    params,
+    cacheControl,
+    supportsCacheControlOnTools,
+    cacheBreakpointOptOutMessageIndexes,
+  );
   return { params, toolProjection, usedCompactionReplay: replayPlan.compaction !== undefined };
 }
 
@@ -786,7 +760,7 @@ export function createAnthropicMessagesTransportStreamFn(): StreamFn {
         );
         const bindingHeaders =
           applyAnthropicThinkingBindingControls(params, betaHeader) ??
-          (betaHeader !== undefined ? { "anthropic-beta": betaHeader } : undefined);
+          (betaHeader ? { "anthropic-beta": betaHeader } : undefined);
         const { response, stream: anthropicStream } = await client.messages.stream(
           { ...params, stream: true },
           { signal: transportOptions.signal, headers: bindingHeaders },

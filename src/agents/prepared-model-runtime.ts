@@ -6,6 +6,7 @@ import { registerRuntimeAuthProfileStoreMutationListener } from "./auth-profiles
 import type { ModelCatalogSnapshot } from "./model-catalog.types.js";
 import {
   PreparedModelRuntimeAuthPublicationOwner,
+  invalidatePreparedModelRuntimeOwnersForAuthMutation,
   type PreparedModelRuntimeAuthMutation,
 } from "./prepared-model-runtime-auth-publication.js";
 import { acquirePreparedModelRuntimeLeaseFromOwners } from "./prepared-model-runtime-lease.js";
@@ -16,8 +17,12 @@ import {
 import { preparedModelInventoryKey } from "./prepared-model-runtime.facts.js";
 import { isPreparedModelCatalogFull } from "./prepared-model-runtime.full-catalog.js";
 import {
+  capturePreparedModelRuntimeLifetime,
+  closePreparedModelRuntimeSnapshots,
+  registerPreparedModelRuntimeClose,
+} from "./prepared-model-runtime.lifecycle.js";
+import {
   PreparedModelRuntimeOwnerNotPublishedError,
-  PreparedModelRuntimeOwnerRetention,
   PreparedModelRuntimePublicationSupersededError,
   advancePreparedModelRuntimeOwnerConfig,
   prepareModelRuntimeOwner,
@@ -33,6 +38,7 @@ import {
   resolvePreparedModelRuntimeOwnerBySnapshot,
   resolveConfiguredOwnerPublication,
   resolvePublishedOwner,
+  readPublishedModelRuntimeSnapshot,
   type PreparedModelRuntimeOwner,
   type PreparedModelRuntimeInput,
   type PreparedModelRuntimePublicationOptions,
@@ -52,6 +58,8 @@ import {
   resolveSafeRefreshAgentIds,
   updateOwnersForScopedRefresh,
 } from "./prepared-model-runtime.refresh-scope.js";
+import { closeEphemeralPreparedModelRuntimeResources } from "./prepared-model-runtime.resources.js";
+import { PreparedModelRuntimeOwnerRetention } from "./prepared-model-runtime.retention.js";
 import type {
   PreparedModelRuntimeCatalogMode,
   PreparedModelRuntimeLeaseOptions,
@@ -102,6 +110,46 @@ const replyDispatchPublication = new PreparedReplyDispatchPublicationOwner({
 });
 export const loadPublishedGatewayReplyDispatchRuntime = replyDispatchPublication.load;
 
+let releaseProcessLifetime: (() => void) | undefined;
+function captureModelRuntimeLifetime(): () => void {
+  const assertCurrent = capturePreparedModelRuntimeLifetime();
+  releaseProcessLifetime ??= registerPreparedModelRuntimeClose(closeModelRuntime);
+  return assertCurrent;
+}
+
+async function closeModelRuntime(error: Error): Promise<void> {
+  refreshRequestEpoch += 1;
+  authPublication.reset(error);
+  pendingModelRuntimeReplacement?.reject(error);
+  pendingModelRuntimeReplacement = undefined;
+  const resourcesClosed = closeEphemeralPreparedModelRuntimeResources();
+  for (const owner of owners.values()) {
+    owner.resourceClaim?.release();
+    owner.resourceClaim = undefined;
+  }
+  owners.clear();
+  retainedDirectRunOwners.clear(owners);
+  retainedGatewayRunOwners.clear(owners);
+  gatewayLifecycleActive = false;
+  replyDispatchPublication.clear();
+  const closed = await Promise.allSettled([
+    refreshTail,
+    ...agentBuildCompletions.values(),
+    ...standaloneActivationTails.values(),
+    resourcesClosed,
+  ]);
+  // A loader that settled after the close fence still owns its failed admission cleanup.
+  const lateResources = await Promise.allSettled([closeEphemeralPreparedModelRuntimeResources()]);
+  const failures = [...closed, ...lateResources].flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length) {
+    throw new AggregateError(failures, "Prepared model runtime resources failed to close");
+  }
+  releaseProcessLifetime?.();
+  releaseProcessLifetime = undefined;
+}
+
 /** Advances model-neutral config identity without rebuilding prepared generation artifacts. */
 export function advancePreparedModelRuntimeConfig(config: OpenClawConfig): void {
   for (const owner of owners.values()) {
@@ -118,12 +166,14 @@ export function advancePreparedModelRuntimeConfig(config: OpenClawConfig): void 
 export async function loadPreparedModelRuntimeSnapshot(
   rawInput: PreparedModelRuntimeInput,
 ): Promise<PreparedModelRuntimeSnapshot> {
+  const assertLifetime = captureModelRuntimeLifetime();
   let input = normalizePreparedModelRuntimeInput({
     ...rawInput,
     preserveWorkspaceDirOnRefresh:
       rawInput.preserveWorkspaceDirOnRefresh ?? rawInput.workspaceDir !== undefined,
   });
   for (;;) {
+    assertLifetime();
     const replacement = pendingModelRuntimeReplacement;
     if (replacement) {
       await replacement.promise;
@@ -143,6 +193,7 @@ export async function loadPreparedModelRuntimeSnapshot(
     if (pendingModelRuntimeReplacement) {
       continue;
     }
+    assertLifetime();
     const activated = await activateStandalonePreparedModelRuntime(input);
     if (pendingModelRuntimeReplacement) {
       continue;
@@ -166,23 +217,9 @@ export async function loadPreparedModelRuntimeSnapshot(
 export function getPreparedModelRuntimeSnapshot(
   rawInput: PreparedModelRuntimeInput,
 ): PreparedModelRuntimeSnapshot | undefined {
-  if (pendingModelRuntimeReplacement) {
-    return undefined;
-  }
-  const input = normalizePreparedModelRuntimeInput(rawInput);
-  const owner = resolvePublishedOwner(owners, input, {
-    allowConfiguredWorkspaceFallback:
-      rawInput.workspaceDir === undefined ||
-      rawInput.agentId === undefined ||
-      rawInput.runtimePluginSelections === undefined,
-  });
-  if (!owner?.snapshot || owner.needsRefresh || owner.pending) {
-    return undefined;
-  }
-  if (input.readOnly && !preparedModelRuntimeConfigsMatch(owner.input.config, input.config)) {
-    return undefined;
-  }
-  return owner.snapshot;
+  return pendingModelRuntimeReplacement
+    ? undefined
+    : readPublishedModelRuntimeSnapshot(owners, rawInput);
 }
 
 /** Publishes one owner from an explicit startup/activation lifecycle boundary. */
@@ -190,6 +227,7 @@ export async function publishPreparedModelRuntimeSnapshot(
   rawInput: PreparedModelRuntimeInput,
   options: PreparedModelRuntimePublicationOptions = {},
 ): Promise<PreparedModelRuntimeSnapshot> {
+  captureModelRuntimeLifetime();
   const input = normalizePreparedModelRuntimeInput(rawInput);
   const existing = owners.get(ownerKey(input));
   if (existing?.pending) {
@@ -226,14 +264,16 @@ export async function publishPreparedModelRuntimeSnapshot(
 /** Activates lifecycle publication for direct embedded runtimes without a gateway startup. */
 export async function activateStandalonePreparedModelRuntime(
   rawInput: PreparedModelRuntimeInput,
+  options: Pick<PreparedModelRuntimePublicationOptions, "catalogMode"> = {},
 ): Promise<PreparedModelRuntimeSnapshot | undefined> {
+  const assertLifetime = captureModelRuntimeLifetime();
   const input = normalizePreparedModelRuntimeInput(rawInput);
   const key = ownerKey(input);
   const previous = standaloneActivationTails.get(key) ?? Promise.resolve();
   // One writer per owner key prevents conflicting config activations from alternately
   // superseding each other's generation while preserving each caller's requested snapshot.
   const activation = previous.then(
-    async () => await activateStandalonePreparedModelRuntimeNow(input),
+    async () => await activateStandalonePreparedModelRuntimeNow(input, assertLifetime, options),
   );
   const tail = activation.then(
     () => undefined,
@@ -251,8 +291,11 @@ export async function activateStandalonePreparedModelRuntime(
 
 async function activateStandalonePreparedModelRuntimeNow(
   input: PreparedModelRuntimeInput,
+  assertLifetime: () => void,
+  options: Pick<PreparedModelRuntimePublicationOptions, "catalogMode">,
 ): Promise<PreparedModelRuntimeSnapshot | undefined> {
   for (;;) {
+    assertLifetime();
     const overlapsConfiguredOwner = [...owners.values()].some(
       (owner) =>
         owner.provenance === "configured" &&
@@ -271,7 +314,7 @@ async function activateStandalonePreparedModelRuntimeNow(
           ...input,
           preserveWorkspaceDirOnRefresh: input.workspaceDir !== undefined,
         },
-        { provenance: "standalone" },
+        { ...options, provenance: "standalone" },
       );
     } catch (error) {
       if (!(error instanceof PreparedModelRuntimePublicationSupersededError)) {
@@ -286,6 +329,7 @@ async function activateStandalonePreparedModelRuntimeNow(
 }
 
 const preparedModelRuntimeLeaseContext = {
+  captureLifetime: captureModelRuntimeLifetime,
   owners,
   agentBuildCompletions,
   retainedDirectRunOwners,
@@ -327,11 +371,13 @@ export async function acquireReadOnlyPreparedModelRuntime(
 export async function prepareModelRuntimeSnapshot(
   rawInput: PreparedModelRuntimeInput,
 ): Promise<PreparedModelRuntimeSnapshot> {
+  const assertLifetime = captureModelRuntimeLifetime();
   const replacement = pendingModelRuntimeReplacement;
   if (replacement) {
     // Individual owners may finish before a multi-owner publication commits. The lifecycle gate
     // makes the generation visible atomically only after every owner and auth mutation is ready.
     await replacement.promise;
+    assertLifetime();
     return await prepareModelRuntimeSnapshot(rawInput);
   }
   const input = normalizePreparedModelRuntimeInput(rawInput);
@@ -358,6 +404,7 @@ export async function prepareModelRuntimeSnapshot(
     } catch {
       // Re-read the owner below so a superseding generation wins over this result or error.
     }
+    assertLifetime();
     return await prepareModelRuntimeSnapshot(rawInput);
   }
   if (existing?.needsRefresh) {
@@ -406,6 +453,7 @@ export function markPreparedModelRuntimeSnapshotsStale(
     agentIds?: ReadonlySet<string>;
   } = {},
 ): PreparedModelRuntimeReplacementGateId | undefined {
+  captureModelRuntimeLifetime();
   replyDispatchPublication.clear();
   if (options.waitForReplacement) {
     const superseded = pendingModelRuntimeReplacement;
@@ -639,28 +687,8 @@ function invalidateForAuthMutation(event: PreparedModelRuntimeAuthMutation): voi
     ...event,
     agentDir: normalizeOptionalDir(event.agentDir),
   };
-  const staleError = new Error("prepared model runtime owner is stale after auth mutation");
-  const invalidatedOwners: PreparedModelRuntimeOwner[] = [];
-  const invalidatedConfiguredAgentIds = new Set<string>();
-  for (const owner of owners.values()) {
-    if (
-      !normalizedEvent.affectsInheritedStores &&
-      owner.input.agentDir !== normalizedEvent.agentDir &&
-      owner.input.inheritedAuthDir !== normalizedEvent.agentDir
-    ) {
-      continue;
-    }
-    invalidatedOwners.push(owner);
-    owner.generation += 1;
-    owner.needsRefresh = true;
-    owner.refreshError = staleError;
-    if (normalizedEvent.profileSetChanged) {
-      owner.catalogStale = true;
-    }
-    if (owner.provenance === "configured" && owner.input.agentId) {
-      invalidatedConfiguredAgentIds.add(owner.input.agentId);
-    }
-  }
+  const { invalidatedOwners, invalidatedConfiguredAgentIds } =
+    invalidatePreparedModelRuntimeOwnersForAuthMutation(owners, normalizedEvent);
   if (invalidatedOwners.length === 0) {
     // A first owner reads the already-published auth snapshot while it builds. Replaying an earlier
     // mutation would immediately stale that initial generation even though no prior owner existed.
@@ -725,22 +753,8 @@ function invalidateForAuthMutation(event: PreparedModelRuntimeAuthMutation): voi
 registerRuntimeAuthProfileStoreMutationListener(invalidateForAuthMutation);
 registerPreparedRuntimeAuthMaterializationPublisher(owners, notifyPreparedModelRuntimePublication);
 
-function resetPreparedModelRuntimeSnapshotsForTest(): void {
-  authPublication.reset(
-    new PreparedModelRuntimePublicationSupersededError(
-      "prepared model runtime auth publication reset for test",
-    ),
-  );
-  pendingModelRuntimeReplacement?.resolve();
-  pendingModelRuntimeReplacement = undefined;
-  owners.clear();
-  agentBuildCompletions.clear();
-  standaloneActivationTails.clear();
-  retainedGatewayRunOwners.clear(owners);
-  gatewayLifecycleActive = false;
-  refreshTail = Promise.resolve();
-  refreshRequestEpoch = 0;
-  replyDispatchPublication.clear();
+async function resetPreparedModelRuntimeSnapshotsForTest(): Promise<void> {
+  await closePreparedModelRuntimeSnapshots();
   resetPreparedModelRuntimePublicationListenersForTest();
   modelRuntimeBuildTimeoutMs = DEFAULT_MODEL_RUNTIME_BUILD_TIMEOUT_MS;
 }
